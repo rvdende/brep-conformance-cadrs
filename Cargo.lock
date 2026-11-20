@@ -56,8 +56,8 @@ dependencies = [
 
 [[package]]
 name = "cadrs_kernel"
-version = "0.2.8"
-source = "git+https://github.com/rvdende/cadrs?rev=6cae1559#6cae155982c4560c9ba659226e03e3e3a9ca6af9"
+version = "0.2.9"
+source = "git+https://github.com/rvdende/cadrs?rev=bb09c367#bb09c367611a3113aaf0dee7e6e0432f7436971f"
 dependencies = [
  "nalgebra",
  "rayon",

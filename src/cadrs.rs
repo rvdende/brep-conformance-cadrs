@@ -8,16 +8,17 @@ use brep_protocol::{Kernel as Protocol, Refusal, model, model::Primitive, profil
 use cadrs_kernel::native::{NativeKernel, tol};
 use cadrs_kernel::{
     Axis, BodyId, BoolOp, ChamferOpts, ChamferSpec, DistanceTarget, DraftSpec, EdgeId, Extent,
-    FaceId, FaceInput, FilletLaw, FilletSpec, Helix, Kernel, KernelError, LoftSection, LoftSpec,
-    Motion, OffsetSpec, OpResult, Pick, PointClass, ProjVisibility, ProjectOptions, ShellSpec,
-    SplitTool, SweepControl, SweepLaw, SweepSpec, Tessellation, ThickenSpec, ViewFrame,
+    FaceId, FaceInput, FilletLaw, FilletProfile, FilletSize, FilletSpec, Helix, Kernel,
+    KernelError, LoftSection, LoftSpec, Motion, OffsetSpec, OpResult, Pick, PointClass,
+    ProjVisibility, ProjectOptions, ShellSpec, SlabSpec, SplitTool, SweepControl, SweepLaw,
+    SweepSpec, Tessellation, ThickenSpec, ViewFrame,
 };
 use nalgebra::{Isometry3, Matrix3, Rotation3, Translation3, UnitQuaternion, Vector3};
 
 use crate::sketch::{legs, meridian, p3, sketch, spline_path, to_world, v3, xy_plane};
 
 /// The cadrs_kernel release the adapter is built on: the `rev` in Cargo.toml.
-const VERSION: &str = "0.2.8 (6cae1559)";
+const VERSION: &str = "0.2.9 (bb09c367)";
 
 /// A solid, or `None` for the empty solid: cadrs has no empty body, and says so by
 /// `EmptyResult`.
@@ -51,6 +52,15 @@ fn empty_or(r: cadrs_kernel::Result<OpResult>) -> Result<Solid, Refusal> {
         Err(KernelError::EmptyResult(_)) => Ok(None),
         r => one(r),
     }
+}
+
+fn unit(a: model::Vec3) -> Result<nalgebra::Unit<Vector3<f64>>, Refusal> {
+    nalgebra::Unit::try_new(v3(a), 0.0)
+        .ok_or_else(|| Refusal::invalid(format!("{a:?} has no direction")))
+}
+
+fn arr(p: nalgebra::Point3<f64>) -> model::Vec3 {
+    [p.x, p.y, p.z]
 }
 
 fn solid(s: &Solid) -> Result<BodyId, Refusal> {
@@ -142,27 +152,8 @@ impl Protocol for Cadrs {
     }
 
     fn unsupported(&self) -> Vec<String> {
-        [
-            // Functions cadrs does not have.
-            "slab",
-            "fillet_g2",
-            "fillet_setback_g2",
-            "curvature",
-            "betti",
-            "section",
-            "section_area",
-            "interference",
-            // cadrs sizes a conic fillet by the radius of the circular fillet it replaces; the
-            // protocol sizes it by its setback from the edge.
-            "fillet_conic",
-            // cadrs's face blend needs two faces that share an edge, and makes a sheet.
-            "fillet_faces",
-            // cadrs measures distances between boundaries; the protocol counts a solid's inside.
-            "closest",
-            "distance",
-        ]
-        .map(String::from)
-        .to_vec()
+        // cadrs has one call for each of the protocol's functions.
+        Vec::new()
     }
 
     fn make(&self, p: &Primitive) -> Result<Solid, Refusal> {
@@ -210,6 +201,8 @@ impl Protocol for Cadrs {
                     axis: z,
                     major,
                     minor,
+                    // The protocol refuses a tube wider than its ring.
+                    spindle: cadrs_kernel::Spindle::Refuse,
                 }))
             }
             Primitive::Extrude {
@@ -267,7 +260,21 @@ impl Protocol for Cadrs {
                 };
                 one(k.sweep_with_law(&sketch(profile, xy_plane(&f))?, &spec, &law))
             }
-            Primitive::Slab { .. } => Err(Refusal::unsupported("cadrs has no height-field slab")),
+            Primitive::Slab {
+                size,
+                ref knots_u,
+                ref knots_v,
+                ref heights,
+                ..
+            } => one(k.slab(&SlabSpec {
+                origin: o,
+                x: unit(f.x)?,
+                y: unit(f.y)?,
+                size,
+                knots_u: knots_u.clone(),
+                knots_v: knots_v.clone(),
+                heights: heights.clone(),
+            })),
             Primitive::Loft {
                 ref profile,
                 scale,
@@ -607,6 +614,159 @@ impl Protocol for Cadrs {
         one(k.thicken_surfaces(&spec))
     }
 
+    fn fillet_g2(
+        &self,
+        s: &Solid,
+        edges: &[model::Vec3],
+        offset: f64,
+        center: f64,
+    ) -> Result<Solid, Refusal> {
+        let b = solid(s)?;
+        let k = &mut *self.k();
+        let ids = edges_at(k, b, edges)?;
+        let spec = FilletSpec {
+            profile: FilletProfile::Thumbweight {
+                center: Some(center),
+            },
+            ..FilletSpec::radius(offset)
+        };
+        one(k.fillet_with(b, &ids, &spec))
+    }
+
+    fn fillet_setback_g2(
+        &self,
+        s: &Solid,
+        edges: &[model::Vec3],
+        radius: f64,
+        setback: f64,
+    ) -> Result<Solid, Refusal> {
+        let b = solid(s)?;
+        let k = &mut *self.k();
+        let ids = edges_at(k, b, edges)?;
+        let spec = FilletSpec {
+            profile: FilletProfile::Thumbweight { center: None },
+            ..FilletSpec::radius(radius)
+        };
+        one(k.fillet_setback(b, &ids, &spec, setback))
+    }
+
+    fn fillet_conic(
+        &self,
+        s: &Solid,
+        edges: &[model::Vec3],
+        setback: f64,
+        rho: f64,
+    ) -> Result<Solid, Refusal> {
+        let b = solid(s)?;
+        let k = &mut *self.k();
+        let ids = edges_at(k, b, edges)?;
+        // A conic fillet sized by its setback from the edge, as the protocol sizes it.
+        let spec = FilletSpec {
+            size: FilletSize::Setback(setback),
+            profile: FilletProfile::Conic { rho },
+            ..FilletSpec::radius(setback)
+        };
+        one(k.fillet_with(b, &ids, &spec))
+    }
+
+    fn fillet_faces(
+        &self,
+        s: &Solid,
+        face_a: model::Vec3,
+        face_b: model::Vec3,
+        radius: f64,
+    ) -> Result<Solid, Refusal> {
+        let b = solid(s)?;
+        let k = &mut *self.k();
+        let [fa, fb] = [face_a, face_b].map(|p| {
+            face_at(k, b, p)?
+                .ok_or_else(|| Refusal::invalid(format!("no face passes through {p:?}")))
+        });
+        one(k.fillet_faces(b, fa?, fb?, radius))
+    }
+
+    fn curvature(
+        &self,
+        s: &Solid,
+        points: &[model::Vec3],
+    ) -> Result<Vec<Option<[f64; 2]>>, Refusal> {
+        let b = solid(s)?;
+        let pts: Vec<_> = points.iter().map(|&p| p3(p)).collect();
+        self.k().curvatures_at(b, &pts).map_err(refusal)
+    }
+
+    fn betti(&self, s: &Solid) -> Result<[u64; 3], Refusal> {
+        let Some(b) = *s else {
+            return Ok([0, 0, 0]);
+        };
+        self.k().betti_numbers(b).map_err(refusal)
+    }
+
+    fn section(
+        &self,
+        s: &Solid,
+        origin: model::Vec3,
+        normal: model::Vec3,
+        tolerance: f64,
+    ) -> Result<Vec<Vec<model::Vec3>>, Refusal> {
+        let Some(b) = *s else {
+            return Ok(Vec::new());
+        };
+        let pieces = self
+            .k()
+            .plane_section(b, p3(origin), v3(normal), tolerance)
+            .map_err(refusal)?;
+        Ok(pieces
+            .into_iter()
+            .map(|p| p.into_iter().map(arr).collect())
+            .collect())
+    }
+
+    fn section_area(
+        &self,
+        s: &Solid,
+        origin: model::Vec3,
+        normal: model::Vec3,
+    ) -> Result<f64, Refusal> {
+        let Some(b) = *s else {
+            return Ok(0.0);
+        };
+        self.k()
+            .section_area(b, p3(origin), v3(normal))
+            .map_err(refusal)
+    }
+
+    fn interference(&self, a: &Solid, b: &Solid) -> Result<brep_protocol::Meeting, Refusal> {
+        let (a, b) = (solid(a)?, solid(b)?);
+        let m = self.k().interference(a, b).map_err(refusal)?;
+        Ok(brep_protocol::Meeting {
+            volume: m.volume,
+            gap: m.gap,
+        })
+    }
+
+    fn closest(&self, s: &Solid, points: &[model::Vec3]) -> Result<Vec<model::Vec3>, Refusal> {
+        let b = solid(s)?;
+        let k = self.k();
+        // `DistanceTarget::Solid` counts the solid's inside, as the protocol does.
+        points
+            .iter()
+            .map(|&p| {
+                k.min_distance(&DistanceTarget::Point(p3(p)), &DistanceTarget::Solid(b))
+                    .map(|r| arr(r.b))
+                    .map_err(refusal)
+            })
+            .collect()
+    }
+
+    fn distance(&self, a: &Solid, b: &Solid) -> Result<f64, Refusal> {
+        let (a, b) = (solid(a)?, solid(b)?);
+        self.k()
+            .min_distance(&DistanceTarget::Solid(a), &DistanceTarget::Solid(b))
+            .map(|r| r.distance)
+            .map_err(refusal)
+    }
+
     fn shell(&self, s: &Solid, open: &[model::Vec3], thickness: f64) -> Result<Solid, Refusal> {
         let b = solid(s)?;
         let k = &mut *self.k();
@@ -617,6 +777,7 @@ impl Protocol for Cadrs {
             // With no face open, the protocol's shell is a closed hollow.
             hollow: open.is_empty(),
             sharp: false,
+            nothing_hollowed: Default::default(),
         };
         one(k.shell_with(b, &spec))
     }
